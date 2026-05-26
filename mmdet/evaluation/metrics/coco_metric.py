@@ -1,4 +1,30 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+# ============================================================
+# 【性能评估：CocoMetric —— COCO 标准 AP 计算】
+#
+# COCO AP 指标体系：
+#   mAP       = AP@[IoU=0.50:0.05:0.95] （主指标，综合考量定位精度）
+#   mAP_50    = AP@IoU=0.50   （传统 VOC 指标）
+#   mAP_75    = AP@IoU=0.75   （严格定位标准）
+#   mAP_s/m/l = 小/中/大目标的 mAP（按 GT 面积分类：<32², 32²~96², >96²）
+#
+# 计算原理（以单类别、单 IoU 阈值为例）：
+#   1. 预测框按置信度从高到低排序
+#   2. 逐个检查每个预测框是否与 GT 匹配（IoU > 阈值 且每个 GT 只匹配一次）
+#   3. 计算 Precision-Recall 曲线
+#   4. AP = PR 曲线下面积（101 点插值）
+#   5. mAP = 所有类别 AP 的平均值
+#
+# 评估流程：
+#   推理阶段（每 batch）：
+#     model.predict → pred_instances（bboxes, scores, labels）
+#     CocoMetric.process → 收集预测结果到 self.results
+#   评估阶段（所有 batch 处理完后）：
+#     CocoMetric.compute_metrics → 调用官方 COCOeval 计算 AP
+#
+# 注意：COCO 格式要求坐标为 (x, y, w, h)，而 mmdet 内部用 (x1, y1, x2, y2)
+#       results2json 中会调用 xyxy2xywh 完成转换
+# ============================================================
 import datetime
 import itertools
 import os.path as osp
@@ -340,9 +366,15 @@ class CocoMetric(BaseMetric):
     # TODO: data_batch is no longer needed, consider adjusting the
     #  parameter position
     def process(self, data_batch: dict, data_samples: Sequence[dict]) -> None:
-        """Process one batch of data samples and predictions. The processed
-        results should be stored in ``self.results``, which will be used to
-        compute the metrics when all batches have been processed.
+        """处理一个 batch 的预测结果，将其格式化并存入 self.results。
+
+        每个 data_sample 对应一张图像，包含：
+          pred_instances.bboxes:  (num_det, 4) float  xyxy 格式，已 rescale 回原图坐标
+          pred_instances.scores:  (num_det,)   float  置信度
+          pred_instances.labels:  (num_det,)   int    类别索引（0-based）
+
+        处理后 self.results 中每项为 (gt_dict, pred_dict) 元组，
+        最终在 compute_metrics 中转换为 COCO JSON 格式调用官方 eval。
 
         Args:
             data_batch (dict): A batch of data from the dataloader.
@@ -353,9 +385,9 @@ class CocoMetric(BaseMetric):
             result = dict()
             pred = data_sample['pred_instances']
             result['img_id'] = data_sample['img_id']
-            result['bboxes'] = pred['bboxes'].cpu().numpy()
-            result['scores'] = pred['scores'].cpu().numpy()
-            result['labels'] = pred['labels'].cpu().numpy()
+            result['bboxes'] = pred['bboxes'].cpu().numpy()   # (num_det, 4) xyxy
+            result['scores'] = pred['scores'].cpu().numpy()   # (num_det,)
+            result['labels'] = pred['labels'].cpu().numpy()   # (num_det,)
             # encode mask to RLE
             if 'masks' in pred:
                 result['masks'] = encode_mask_results(
@@ -380,14 +412,31 @@ class CocoMetric(BaseMetric):
             self.results.append((gt, result))
 
     def compute_metrics(self, results: list) -> Dict[str, float]:
-        """Compute the metrics from processed results.
+        """汇总所有 batch 的结果，调用官方 COCO API 计算 AP。
+
+        【计算流程】
+          1. 将预测结果写入 JSON 文件（results2json，bbox 坐标转为 xywh）
+          2. 用 COCOeval（官方实现）评估：
+             coco_eval.evaluate()    → 计算每张图每个类别的 PR 数据
+             coco_eval.accumulate()  → 汇总为精度矩阵 (iou_thrs, recall_thrs, classes, areas, maxDets)
+             coco_eval.summarize()   → 从矩阵中提取 AP/AR 数值
+          3. 返回 eval_results dict
+
+        【输出指标（coco_eval.stats 的索引对应关系）】
+          stats[0] = mAP        (AP @[0.5:0.95])   ← 最重要指标
+          stats[1] = mAP_50     (AP @0.5)
+          stats[2] = mAP_75     (AP @0.75)
+          stats[3] = mAP_s      (small objects, area < 32²)
+          stats[4] = mAP_m      (medium objects, 32² ~ 96²)
+          stats[5] = mAP_l      (large objects, area > 96²)
+          stats[6] = AR @max=100 (平均召回率，最多检测 100 个)
+          ...
 
         Args:
-            results (list): The processed results of each batch.
+            results (list): list of (gt_dict, pred_dict) tuples
 
         Returns:
-            Dict[str, float]: The computed metrics. The keys are the names of
-            the metrics, and the values are corresponding results.
+            Dict[str, float]: 如 {'coco/bbox_mAP': 0.456, 'coco/bbox_mAP_50': 0.678, ...}
         """
         logger: MMLogger = MMLogger.get_current_instance()
 
@@ -462,14 +511,19 @@ class CocoMetric(BaseMetric):
                     'The testing results of the whole dataset is empty.')
                 break
 
+            # 初始化官方 COCO eval（pycocotools），指定 iou_type='bbox' 或 'segm'
             coco_eval = COCOeval(self._coco_api, coco_dt, iou_type)
 
             coco_eval.params.catIds = self.cat_ids
             coco_eval.params.imgIds = self.img_ids
             coco_eval.params.maxDets = list(self.proposal_nums)
+            # 默认 iouThrs = [0.5, 0.55, ..., 0.95]（共 10 个阈值），mAP 是其平均值
             coco_eval.params.iouThrs = self.iou_thrs
 
-            # mapping of cocoEval.stats
+            # coco_eval.stats 输出的 12 个指标索引映射
+            # stats 是一个长度 12 的 numpy 数组：
+            #   [AP@[.50:.05:.95], AP@.50, AP@.75, AP_s, AP_m, AP_l,
+            #    AR@1,  AR@10,  AR@100, AR_s, AR_m, AR_l]
             coco_metric_names = {
                 'mAP': 0,
                 'mAP_50': 1,

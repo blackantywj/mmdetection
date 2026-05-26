@@ -1,4 +1,22 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+# ============================================================
+# 【数据流第三站：DetDataPreprocessor —— 模型入口的归一化与批处理】
+#
+# Pipeline 中 PackDetInputs 打包好的 DetDataSample 经 DataLoader 收集后，
+# 先经过 DetDataPreprocessor，再送入检测器 forward()。
+#
+# 主要操作（顺序）：
+#   1. cast_data：将数据移到 GPU
+#   2. super().forward：
+#      a. BGR→RGB 转换（可选）
+#      b. 归一化：img = (img - mean) / std
+#         - mean=(123.675,116.28,103.53), std=(58.395,57.12,57.375) 为 ImageNet 均值
+#      c. 批内 Pad：将同批图像 pad 到最大尺寸（同时满足 pad_size_divisor=32）
+#         单张 img (C,H,W) → 批内统一 (C, H_batch, W_batch)
+#         最终 batch_inputs: (N, 3, H_batch, W_batch)  float32
+#   3. 记录 batch_input_shape 和 pad_shape 到 data_samples（DETR 需要用）
+#   4. 训练时应用 batch_augments（如 MixUp、Mosaic）
+# ============================================================
 import random
 from numbers import Number
 from typing import List, Optional, Sequence, Tuple, Union
@@ -108,8 +126,16 @@ class DetDataPreprocessor(ImgDataPreprocessor):
         self.boxtype2tensor = boxtype2tensor
 
     def forward(self, data: dict, training: bool = False) -> dict:
-        """Perform normalization、padding and bgr2rgb conversion based on
-        ``BaseDataPreprocessor``.
+        """执行归一化、padding 和 BGR→RGB 转换。
+
+        【输入输出 shape】
+          输入  data['inputs']: list of Tensor, each (3, H_i, W_i)  float32
+          输出  inputs:         Tensor (N, 3, H_batch, W_batch)      float32 归一化后
+                                H_batch = max(H_i) 向上取整到 pad_size_divisor
+                                W_batch = max(W_i) 向上取整到 pad_size_divisor
+          data_samples 中额外记录：
+            batch_input_shape = (H_batch, W_batch)  — Deformable-DETR 构造 mask 需要
+            pad_shape         = (H_pad_i, W_pad_i)  — 单张图 pad 后的实际尺寸
 
         Args:
             data (dict): Data sampled from dataloader.

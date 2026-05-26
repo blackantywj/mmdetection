@@ -1,4 +1,25 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+# ============================================================
+# 【ConvFCBBoxHead / Shared2FCBBoxHead：Faster-RCNN 分类回归头】
+#
+# 网络结构图（Shared2FCBBoxHead 默认配置）：
+#
+#   bbox_feats: (num_rois, 256, 7, 7)
+#     ↓ flatten
+#   (num_rois, 256×7×7) = (num_rois, 12544)
+#     ↓ Linear(12544, 1024) + ReLU     ← shared_fcs[0]
+#   (num_rois, 1024)
+#     ↓ Linear(1024, 1024) + ReLU      ← shared_fcs[1]
+#   (num_rois, 1024)   ← 共享特征，分叉给两个分支
+#     ├─ Linear(1024, num_classes+1)   → cls_score:  (num_rois, num_classes+1)
+#     └─ Linear(1024, 4×num_classes)   → bbox_pred:  (num_rois, 4×num_classes)
+#
+# Shared4Conv1FCBBoxHead 则先用 4 个 Conv，再用 1 个 FC。
+#
+# 【损失函数（在父类 BBoxHead 中定义）】
+#   loss_cls:  CrossEntropyLoss，num_classes+1 类（含背景）
+#   loss_bbox: SmoothL1Loss，只对正样本（前景）计算
+# ============================================================
 from typing import Optional, Tuple, Union
 
 import torch.nn as nn
@@ -161,36 +182,44 @@ class ConvFCBBoxHead(BBoxHead):
         return branch_convs, branch_fcs, last_layer_dim
 
     def forward(self, x: Tuple[Tensor]) -> tuple:
-        """Forward features from the upstream network.
+        """BBox Head 前向推理。
+
+        【Shared2FCBBoxHead 的 shape 变化（COCO 80类，num_rois=512）】
+          x:          (512, 256, 7, 7)   ROI Align 输出
+            ↓ flatten(1)
+          x:          (512, 12544)       展平（256×7×7=12544）
+            ↓ shared_fcs[0]: Linear(12544→1024) + ReLU
+          x:          (512, 1024)
+            ↓ shared_fcs[1]: Linear(1024→1024) + ReLU
+          x:          (512, 1024)        共享特征，分叉给两支
+            ├─ fc_cls: Linear(1024→81)
+          cls_score:  (512, 81)          81 = 80 类 + 1 背景
+            └─ fc_reg: Linear(1024→320)
+          bbox_pred:  (512, 320)         320 = 80 × 4（每类独立回归）
 
         Args:
-            x (tuple[Tensor]): Features from the upstream network, each is
-                a 4D-tensor.
+            x (Tensor): bbox_feats, shape (num_rois, C, roi_h, roi_w)
 
         Returns:
-            tuple: A tuple of classification scores and bbox prediction.
-
-                - cls_score (Tensor): Classification scores for all \
-                    scale levels, each is a 4D-tensor, the channels number \
-                    is num_base_priors * num_classes.
-                - bbox_pred (Tensor): Box energies / deltas for all \
-                    scale levels, each is a 4D-tensor, the channels number \
-                    is num_base_priors * 4.
+            tuple:
+                cls_score (Tensor): (num_rois, num_classes + 1)
+                bbox_pred (Tensor): (num_rois, 4 × num_classes)
         """
-        # shared part
+        # shared part（Shared2FCBBoxHead 时 num_shared_convs=0，num_shared_fcs=2）
         if self.num_shared_convs > 0:
             for conv in self.shared_convs:
-                x = conv(x)
+                x = conv(x)  # 3×3 conv，保持 spatial 不变
 
         if self.num_shared_fcs > 0:
             if self.with_avg_pool:
                 x = self.avg_pool(x)
-
+            # (num_rois, C, H, W) → (num_rois, C×H×W)
             x = x.flatten(1)
 
             for fc in self.shared_fcs:
-                x = self.relu(fc(x))
-        # separate branches
+                x = self.relu(fc(x))  # Linear + ReLU
+
+        # separate branches（共享特征分叉）
         x_cls = x
         x_reg = x
 
@@ -212,8 +241,8 @@ class ConvFCBBoxHead(BBoxHead):
         for fc in self.reg_fcs:
             x_reg = self.relu(fc(x_reg))
 
-        cls_score = self.fc_cls(x_cls) if self.with_cls else None
-        bbox_pred = self.fc_reg(x_reg) if self.with_reg else None
+        cls_score = self.fc_cls(x_cls) if self.with_cls else None  # (num_rois, C+1)
+        bbox_pred = self.fc_reg(x_reg) if self.with_reg else None  # (num_rois, 4C)
         return cls_score, bbox_pred
 
 

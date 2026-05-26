@@ -1,4 +1,22 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+# ============================================================
+# 【数据流第二站：几何变换与数值变换】
+#
+# 典型 COCO 检测 pipeline（训练）：
+#   LoadImageFromFile  → img: (H_ori, W_ori, 3) uint8 BGR
+#   LoadAnnotations    → gt_bboxes: (N,4), gt_bboxes_labels: (N,)
+#   Resize             → img: (H_new, W_new, 3)，保持长宽比缩放
+#                        gt_bboxes 随 scale_factor 同步缩放
+#   RandomFlip         → 随机水平翻转（概率 0.5）
+#                        gt_bboxes x 坐标镜像翻转
+#   PackDetInputs      → 将 results dict 打包为 DetDataSample
+#
+# 测试 pipeline 类似但不含随机增强。
+#
+# DetDataPreprocessor（在模型内）再完成：
+#   - 归一化（减均值除标准差）
+#   - 批内 Pad 到统一大小（32 的倍数）
+# ============================================================
 import copy
 import inspect
 import math
@@ -195,7 +213,13 @@ class Resize(MMCV_Resize):
                     results['img_shape'])
 
     def _resize_bboxes(self, results: dict) -> None:
-        """Resize bounding boxes with ``results['scale_factor']``."""
+        """Resize bounding boxes with ``results['scale_factor']``.
+
+        scale_factor = (w_scale, h_scale)，例如将 640×480 缩放到 1333×800：
+          w_scale = 1333/640 ≈ 2.08，h_scale = 800/480 ≈ 1.67
+        gt_bboxes (N,4) 的 x 坐标 × w_scale，y 坐标 × h_scale。
+        clip_ 将超出图像边界的框裁剪到 [0, img_w] × [0, img_h]。
+        """
         if results.get('gt_bboxes', None) is not None:
             results['gt_bboxes'].rescale_(results['scale_factor'])
             if self.clip_object_border:
@@ -214,8 +238,15 @@ class Resize(MMCV_Resize):
 
     @autocast_box_type()
     def transform(self, results: dict) -> dict:
-        """Transform function to resize images, bounding boxes and semantic
-        segmentation map.
+        """缩放图像、边界框、掩码和语义分割图。
+
+        【输入→输出 shape 示例（COCO 典型配置 scale=(1333,800)）】
+          img:      (H_ori, W_ori, 3)  →  (H_new, W_new, 3)
+          gt_bboxes (N,4) 坐标乘以 scale_factor=(w_scale, h_scale)
+
+        keep_ratio=True 时，短边缩放到 scale 内，长边不超过另一维：
+          如 scale=(1333,800)，一张 640×480 图会变成 1067×800（短边 800）
+          scale_factor ≈ (1.667, 1.667)
 
         Args:
             results (dict): Result dict from loading pipeline.
@@ -229,10 +260,10 @@ class Resize(MMCV_Resize):
         else:
             img_shape = results['img'].shape[:2]
             results['scale'] = _scale_size(img_shape[::-1], self.scale_factor)
-        self._resize_img(results)
-        self._resize_bboxes(results)
-        self._resize_masks(results)
-        self._resize_seg(results)
+        self._resize_img(results)       # 用 cv2.resize 缩放图像
+        self._resize_bboxes(results)    # bbox 坐标 × scale_factor
+        self._resize_masks(results)     # 掩码 rescale（BitmapMasks 用双线性插值）
+        self._resize_seg(results)       # 语义分割图用 nearest 插值
         self._record_homography_matrix(results)
         return results
 
@@ -771,7 +802,15 @@ class Pad(MMCV_Pad):
                 pad_shape, pad_val=pad_val)
 
     def transform(self, results: dict) -> dict:
-        """Call function to pad images, masks, semantic segmentation maps.
+        """将图像/掩码/分割图 pad 到目标尺寸。
+
+        【典型用途】
+        size_divisor=32 时，将图像 pad 到 32 的倍数，以满足 FPN stride 要求。
+        例如 (800, 1067) → pad 到 (800, 1088)（1088 是 1067 向上取整到最近的 32 倍数）。
+        pad 值默认为 0（黑色），不影响检测框的坐标（框坐标不随 pad 改变）。
+
+        注意：Pad 在 pipeline 中通常在 Resize 之后，PackDetInputs 之前。
+             训练时 Pad 在单张图上，DetDataPreprocessor 再对整个 batch 做统一 pad。
 
         Args:
             results (dict): Result dict from loading pipeline.
@@ -779,9 +818,9 @@ class Pad(MMCV_Pad):
         Returns:
             dict: Updated result dict.
         """
-        self._pad_img(results)
-        self._pad_seg(results)
-        self._pad_masks(results)
+        self._pad_img(results)      # img: (H, W, 3) → (H_pad, W_pad, 3)，右下填充
+        self._pad_seg(results)      # gt_seg_map 同步 pad
+        self._pad_masks(results)    # gt_masks (N,H,W) 同步 pad
         return results
 
 

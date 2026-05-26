@@ -1,4 +1,26 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+# ============================================================
+# 【Deformable DETR Transformer 层定义】
+#
+# 多尺度可变形注意力（MultiScaleDeformableAttention）原理：
+#   - 对每个 query 位置，先预测 K 个采样偏移量（offset）
+#   - 在 4 个 FPN 层级的特征图上各采样 K 个位置（默认 K=4）
+#   - 对采样特征加权求和（softmax 注意力权重）
+#
+#   计算复杂度：O(L × N_q × K)  vs  标准注意力 O(N_q × N_kv)
+#   当 N_kv = sum_hw ≈ 22000 时，可变形注意力快 ~100 倍
+#
+# DeformableDetrTransformerEncoder：
+#   输入/输出:  (N, sum_hw, 256)
+#   每层：MultiScaleDeformableAttention（自注意力）+ FFN
+#   num_layers = 6（默认）
+#
+# DeformableDetrTransformerDecoder：
+#   输入:  query (N, 300, 256)，memory (N, sum_hw, 256)
+#   输出:  inter_states (num_layers, N, 300, 256)
+#   每层：Self-Attention + 可变形 Cross-Attention + FFN
+#   with_box_refine=True 时，每层结束后更新 reference_points
+# ============================================================
 from typing import Optional, Tuple, Union
 
 import torch
@@ -170,19 +192,30 @@ class DeformableDetrTransformerDecoder(DetrTransformerDecoder):
               layers, has shape (num_decoder_layers, bs, num_queries, 4). The
               coordinates are arranged as (cx, cy, w, h)
         """
-        output = query
+        output = query    # (N, 300, 256)
         intermediate = []
         intermediate_reference_points = []
         for layer_id, layer in enumerate(self.layers):
+            # ── 将归一化参考点坐标转换到各层特征图坐标系 ─────────────────
+            # valid_ratios: (N, num_levels, 2) ← 有效区域比例（pad 后部分图像较小）
+            # reference_points_input: (N, 300, num_levels, 2) 或 (N, 300, num_levels, 4)
             if reference_points.shape[-1] == 4:
+                # as_two_stage=True 时 reference_points 为 (cx,cy,w,h) 4D
                 reference_points_input = \
                     reference_points[:, :, None] * \
                     torch.cat([valid_ratios, valid_ratios], -1)[:, None]
             else:
                 assert reference_points.shape[-1] == 2
+                # 单阶段模式：reference_points 为 (cx,cy) 2D
                 reference_points_input = \
                     reference_points[:, :, None] * \
-                    valid_ratios[:, None]
+                    valid_ratios[:, None]    # (N, 300, num_levels, 2)
+
+            # 每个 Decoder 层的完整计算：
+            #   1. Self-Attention (query, query) → (N, 300, 256)
+            #   2. 可变形 Cross-Attention (query → memory) → (N, 300, 256)
+            #      每个 query 在 4 层特征上各采样 4 个点（共 16 个采样点）
+            #   3. FFN → (N, 300, 256)
             output = layer(
                 output,
                 query_pos=query_pos,
@@ -192,26 +225,35 @@ class DeformableDetrTransformerDecoder(DetrTransformerDecoder):
                 level_start_index=level_start_index,
                 valid_ratios=valid_ratios,
                 reference_points=reference_points_input,
-                **kwargs)
+                **kwargs)   # output: (N, 300, 256)
 
+            # ── Box Refinement（with_box_refine=True 时）─────────────────
             if reg_branches is not None:
-                tmp_reg_preds = reg_branches[layer_id](output)
+                # 用第 layer_id 个回归头预测 bbox 修正量
+                tmp_reg_preds = reg_branches[layer_id](output)   # (N, 300, 4)
                 if reference_points.shape[-1] == 4:
+                    # 4D 模式：(cx,cy,w,h) 全部更新
+                    # inverse_sigmoid + delta + sigmoid：在 sigmoid 空间做残差修正
                     new_reference_points = tmp_reg_preds + inverse_sigmoid(
                         reference_points)
                     new_reference_points = new_reference_points.sigmoid()
                 else:
                     assert reference_points.shape[-1] == 2
+                    # 2D 模式：只更新中心坐标 (cx,cy)，w/h 取自预测
                     new_reference_points = tmp_reg_preds
                     new_reference_points[..., :2] = tmp_reg_preds[
                         ..., :2] + inverse_sigmoid(reference_points)
                     new_reference_points = new_reference_points.sigmoid()
+                # .detach() 使 reference_points 不传递梯度到上一层（避免梯度循环）
                 reference_points = new_reference_points.detach()
 
             if self.return_intermediate:
                 intermediate.append(output)
                 intermediate_reference_points.append(reference_points)
 
+        # 返回所有中间层的输出（用于辅助损失监督）
+        # intermediate: list of (N, 300, 256) × num_layers
+        # → stack → (num_layers, N, 300, 256)
         if self.return_intermediate:
             return torch.stack(intermediate), torch.stack(
                 intermediate_reference_points)

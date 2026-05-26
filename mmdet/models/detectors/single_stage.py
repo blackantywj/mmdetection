@@ -1,4 +1,21 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+# ============================================================
+# 【单阶段检测器基类 —— FCOS/RetinaNet/SSD 等都继承此类】
+#
+# 单阶段检测器的前向流程：
+#   batch_inputs (N,3,H,W)
+#     ↓ backbone（如 ResNet-50）
+#   多尺度特征 [(N,256,H/8,W/8), (N,512,H/16,W/16), (N,1024,H/32,W/32), (N,2048,H/64,W/64)]
+#     ↓ neck（如 FPN）
+#   FPN 输出 [(N,256,H/8,W/8), ..., (N,256,H/128,W/128)]  通道统一为 256
+#     ↓ bbox_head（如 FCOSHead）
+#   预测输出（每个 FPN 层级）：
+#     cls_scores[l]:    (N, num_classes, H_l, W_l)
+#     bbox_preds[l]:    (N, 4, H_l, W_l)
+#     [centernesses[l]: (N, 1, H_l, W_l)]  FCOS 特有
+#
+# 训练时调 loss()，推理时调 predict()，两者均先 extract_feat() 获取特征。
+# ============================================================
 from typing import List, Tuple, Union
 
 from torch import Tensor
@@ -134,7 +151,23 @@ class SingleStageDetector(BaseDetector):
         return results
 
     def extract_feat(self, batch_inputs: Tensor) -> Tuple[Tensor]:
-        """Extract features.
+        """提取多尺度特征（Backbone + Neck）。
+
+        【shape 变化（以 ResNet50 + FPN 为例，输入 800×1333）】
+          batch_inputs: (N, 3, 800, 1333)
+            ↓ ResNet-50 backbone（输出 C2~C5 四个阶段）
+          backbone 输出:
+            C3: (N, 512,  100, 167)  stride=8
+            C4: (N, 1024,  50,  84)  stride=16
+            C5: (N, 2048,  25,  42)  stride=32
+            (C2 通常不用于 FPN)
+            ↓ FPN（每层用 1×1 conv 统一到 256 通道，再加 P6/P7 额外层）
+          neck 输出 (P3~P7):
+            P3: (N, 256, 100, 167)  stride=8
+            P4: (N, 256,  50,  84)  stride=16
+            P5: (N, 256,  25,  42)  stride=32
+            P6: (N, 256,  13,  21)  stride=64   (从 P5 下采样)
+            P7: (N, 256,   7,  11)  stride=128  (从 P6 下采样)
 
         Args:
             batch_inputs (Tensor): Image tensor with shape (N, C, H ,W).
@@ -143,7 +176,7 @@ class SingleStageDetector(BaseDetector):
             tuple[Tensor]: Multi-level features that may have
             different resolutions.
         """
-        x = self.backbone(batch_inputs)
+        x = self.backbone(batch_inputs)  # 返回 tuple，每项对应一个 stage 输出
         if self.with_neck:
-            x = self.neck(x)
+            x = self.neck(x)  # FPN 统一通道数，返回从高分辨率到低分辨率的特征 tuple
         return x

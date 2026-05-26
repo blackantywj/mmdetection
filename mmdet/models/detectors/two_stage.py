@@ -1,4 +1,22 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+# ============================================================
+# 【TwoStageDetector：两阶段检测器基类】
+#
+# 训练时 loss() 的调用链：
+#   1. extract_feat(batch_inputs)          → 多尺度特征 x
+#   2. rpn_head.loss_and_predict(x, ...)   → rpn_losses + proposals
+#      RPN 使用 MaxIoUAssigner 给 anchor 分配标签
+#      正样本：IoU > 0.7，负样本：IoU < 0.3
+#   3. roi_head.loss(x, proposals, ...)    → roi_losses
+#      ROI Head 使用 MaxIoUAssigner 给 proposal 分配标签
+#      正样本：IoU > 0.5（与任一 GT box），每张图 512 个 proposals
+#
+# 推理时 predict() 的调用链：
+#   1. extract_feat(batch_inputs)
+#   2. rpn_head.predict(x, ..., rescale=False)  → proposals
+#   3. roi_head.predict(x, proposals, ..., rescale=True)  → final results
+#      rescale=True 会将坐标从模型输入尺寸映射回原始图像尺寸
+# ============================================================
 import copy
 import warnings
 from typing import List, Tuple, Union
@@ -157,20 +175,23 @@ class TwoStageDetector(BaseDetector):
         Returns:
             dict: A dictionary of loss components
         """
+        # 特征提取：batch_inputs (N,3,H,W) → x: list of FPN 特征
         x = self.extract_feat(batch_inputs)
 
         losses = dict()
 
-        # RPN forward and loss
+        # ── 第一阶段：RPN 前向 + 损失计算 ──────────────────────────────
         if self.with_rpn:
             proposal_cfg = self.train_cfg.get('rpn_proposal',
                                               self.test_cfg.rpn)
             rpn_data_samples = copy.deepcopy(batch_data_samples)
-            # set cat_id of gt_labels to 0 in RPN
+            # RPN 只做前景/背景二分类，所有 GT 类别统一设为 0（前景类）
             for data_sample in rpn_data_samples:
                 data_sample.gt_instances.labels = \
                     torch.zeros_like(data_sample.gt_instances.labels)
 
+            # 同时计算 RPN 损失并生成 proposals（训练时也需要 proposals 供 ROI Head 用）
+            # rpn_results_list: list of InstanceData，每张图约 2000 个候选框
             rpn_losses, rpn_results_list = self.rpn_head.loss_and_predict(
                 x, rpn_data_samples, proposal_cfg=proposal_cfg)
             # avoid get same name with roi_head loss
@@ -187,6 +208,13 @@ class TwoStageDetector(BaseDetector):
                 data_sample.proposals for data_sample in batch_data_samples
             ]
 
+        # ── 第二阶段：ROI Head 前向 + 损失计算 ──────────────────────────
+        # roi_head 内部：
+        #   1. MaxIoUAssigner 给 proposals 分配 GT（IoU>0.5 正样本，IoU<0.5 负样本）
+        #   2. RandomSampler 采样 512 个（正负比例 1:3）
+        #   3. SingleRoIExtractor 提取 ROI 特征：(num_rois, 256, 7, 7)
+        #   4. bbox_head 预测 cls_score + bbox_pred
+        #   5. CrossEntropy + SmoothL1 计算损失
         roi_losses = self.roi_head.loss(x, rpn_results_list,
                                         batch_data_samples)
         losses.update(roi_losses)

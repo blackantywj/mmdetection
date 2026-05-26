@@ -1,4 +1,16 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+# ============================================================
+# 【数据流第一站：图像与标注的加载模块】
+#
+# 检测数据 pipeline 通常如下：
+#   LoadImageFromFile  →  图像读入内存，shape = (H_ori, W_ori, 3) BGR uint8
+#   LoadAnnotations    →  边界框/掩码标注解析到 results 字典
+#   Resize             →  缩放到目标尺寸
+#   RandomFlip         →  随机翻转（同步更新 bbox/mask）
+#   PackDetInputs      →  打包成 DetDataSample 供模型使用
+#
+# 本文件负责最开始的两步：图像读取 + 标注解析。
+# ============================================================
 from typing import Optional, Tuple, Union
 
 import mmcv
@@ -269,7 +281,12 @@ class LoadAnnotations(MMCV_LoadAnnotations):
         self.ignore_index = ignore_index
 
     def _load_bboxes(self, results: dict) -> None:
-        """Private function to load bounding box annotations.
+        """从 results['instances'] 中提取边界框。
+
+        【输出 shape】
+          results['gt_bboxes']       : HorizontalBoxes, shape (N, 4), xyxy 格式, float32
+          results['gt_ignore_flags'] : bool np.ndarray, shape (N,)
+                                       1 表示该框应在训练中忽略（iscrowd 等）
 
         Args:
             results (dict): Result dict from :obj:``mmengine.BaseDataset``.
@@ -285,12 +302,18 @@ class LoadAnnotations(MMCV_LoadAnnotations):
             results['gt_bboxes'] = np.array(
                 gt_bboxes, dtype=np.float32).reshape((-1, 4))
         else:
+            # 默认 box_type='hbox'，HorizontalBoxes 封装了坐标变换/裁剪等操作
+            # 后续 Resize/RandomFlip 均通过 gt_bboxes.project_() / .clip_() 同步更新
             _, box_type_cls = get_box_type(self.box_type)
             results['gt_bboxes'] = box_type_cls(gt_bboxes, dtype=torch.float32)
         results['gt_ignore_flags'] = np.array(gt_ignore_flags, dtype=bool)
 
     def _load_labels(self, results: dict) -> None:
-        """Private function to load label annotations.
+        """从 results['instances'] 中提取类别标签。
+
+        【输出 shape】
+          results['gt_bboxes_labels'] : np.int64, shape (N,)
+                                        值域 [0, num_classes-1]，与 gt_bboxes 一一对应
 
         Args:
             results (dict): Result dict from :obj:``mmengine.BaseDataset``.

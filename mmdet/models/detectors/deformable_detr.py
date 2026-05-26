@@ -1,4 +1,46 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+# ============================================================
+# 【Deformable DETR：可变形注意力的端到端目标检测器】
+# 论文：Zhu et al., ICLR 2021  https://arxiv.org/abs/2010.04159
+#
+# 核心创新：
+#   1. 多尺度可变形注意力（MultiScaleDeformableAttention）
+#      - 只关注参考点附近 K 个采样点（而非全局注意力），计算复杂度从 O(n²) 降至 O(n)
+#      - 同时在 4 个 FPN 层级上采样，融合多尺度信息
+#   2. 多尺度特征（4 个 FPN 层级 vs 原始 DETR 单层）
+#      极大提升对小目标的检测能力
+#
+# 【整体前向流程（单阶段模式 as_two_stage=False）】
+#   batch_inputs (N, 3, H, W)
+#     ↓ backbone + neck → FPN 特征 [(N,256,H1,W1), ..., (N,256,H4,W4)]
+#
+#   pre_transformer：
+#     展平所有层级特征 → feat_flatten: (N, sum(H_l×W_l), 256)
+#     生成位置编码  → pos_embed: 同上
+#     生成 mask      → mask_flatten: (N, sum(H_l×W_l))
+#
+#   forward_encoder（Transformer Encoder）：
+#     输入/输出: (N, sum(H_l×W_l), 256)  ← 多尺度可变形自注意力
+#     输出称为 memory
+#
+#   pre_decoder：
+#     query = 可学习嵌入 query_embedding[:, 256:] → (N, num_queries, 256)
+#     query_pos = query_embedding[:, :256]         → (N, num_queries, 256)
+#     reference_points = fc(query_pos).sigmoid()   → (N, num_queries, 2)  cx, cy
+#
+#   forward_decoder（Transformer Decoder）：
+#     输入: query (N, 300, 256) + memory (N, sum_hw, 256)
+#     decoder 有 6 层，每层输出 hidden (N, 300, 256)
+#     输出: inter_states: (6, N, 300, 256), inter_references: (7, N, 300, 2)
+#
+#   bbox_head：
+#     cls_scores:  (6, N, 300, num_classes)  每层解码器各自预测
+#     bbox_preds:  (6, N, 300, 4)            cx, cy, w, h（相对 [0,1] 坐标）
+#     损失计算：对最后一层用 HungarianMatcher 做一对一匹配
+#
+# 【with_box_refine=True】各解码器层的 reference_points 不断用上一层预测修正
+# 【as_two_stage=True】 Encoder 输出先生成 proposals，再输入 Decoder
+# ============================================================
 import math
 from typing import Dict, Tuple
 
@@ -148,7 +190,10 @@ class DeformableDETR(DetectionTransformer):
         """
         batch_size = mlvl_feats[0].size(0)
 
-        # construct binary masks for the transformer.
+        # ── 构建 padding mask ────────────────────────────────────────────
+        # 检测批内图像尺寸不同，pad 后填充区域需要被 attention 忽略
+        # masks[i, h:, w:] = 1（无效 pad 区域），masks[i, :h, :w] = 0（有效区域）
+        # shape: (N, input_img_h, input_img_w) → 如 (N, 800, 1333)
         assert batch_data_samples is not None
         batch_input_shape = batch_data_samples[0].batch_input_shape
         img_shape_list = [sample.img_shape for sample in batch_data_samples]
@@ -160,6 +205,9 @@ class DeformableDETR(DetectionTransformer):
         # NOTE following the official DETR repo, non-zero values representing
         # ignored positions, while zero values means valid positions.
 
+        # ── 为每个 FPN 层级下采样 mask + 生成正弦位置编码 ─────────────────
+        # mlvl_masks[l]:     (N, H_l, W_l)   bool，对应特征图大小的 mask
+        # mlvl_pos_embeds[l]: (N, 256, H_l, W_l) 二维正弦位置编码
         mlvl_masks = []
         mlvl_pos_embeds = []
         for feat in mlvl_feats:
@@ -168,6 +216,7 @@ class DeformableDETR(DetectionTransformer):
                               size=feat.shape[-2:]).to(torch.bool).squeeze(0))
             mlvl_pos_embeds.append(self.positional_encoding(mlvl_masks[-1]))
 
+        # ── 将各层级特征展平并拼接 ──────────────────────────────────────
         feat_flatten = []
         lvl_pos_embed_flatten = []
         mask_flatten = []
@@ -175,11 +224,12 @@ class DeformableDETR(DetectionTransformer):
         for lvl, (feat, mask, pos_embed) in enumerate(
                 zip(mlvl_feats, mlvl_masks, mlvl_pos_embeds)):
             batch_size, c, h, w = feat.shape
-            # [bs, c, h_lvl, w_lvl] -> [bs, h_lvl*w_lvl, c]
+            # (N, 256, H_l, W_l) → (N, H_l×W_l, 256)  seq 维度在中间
             feat = feat.view(batch_size, c, -1).permute(0, 2, 1)
             pos_embed = pos_embed.view(batch_size, c, -1).permute(0, 2, 1)
+            # 位置编码 + 层级编码（level_embed 区分不同 FPN 层）
             lvl_pos_embed = pos_embed + self.level_embed[lvl].view(1, 1, -1)
-            # [bs, h_lvl, w_lvl] -> [bs, h_lvl*w_lvl]
+            # (N, H_l, W_l) → (N, H_l×W_l)
             mask = mask.flatten(1)
             spatial_shape = (h, w)
 
@@ -188,11 +238,13 @@ class DeformableDETR(DetectionTransformer):
             mask_flatten.append(mask)
             spatial_shapes.append(spatial_shape)
 
-        # (bs, num_feat_points, dim)
-        feat_flatten = torch.cat(feat_flatten, 1)
+        # 沿 seq 维度拼接所有层级：(N, sum_l(H_l×W_l), 256)
+        # 以 4 层 FPN、输入 800×1333 为例：sum_hw ≈ 100×167+50×84+25×42+13×21
+        #   = 16700 + 4200 + 1050 + 273 ≈ 22223
+        feat_flatten = torch.cat(feat_flatten, 1)           # (N, sum_hw, 256)
         lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)
         # (bs, num_feat_points), where num_feat_points = sum_lvl(h_lvl*w_lvl)
-        mask_flatten = torch.cat(mask_flatten, 1)
+        mask_flatten = torch.cat(mask_flatten, 1)           # (N, sum_hw)
 
         spatial_shapes = torch.as_tensor(  # (num_level, 2)
             spatial_shapes,
@@ -298,15 +350,19 @@ class DeformableDETR(DetectionTransformer):
         """
         batch_size, _, c = memory.shape
         if self.as_two_stage:
+            # ── 两阶段模式：Encoder 输出生成 proposals，再传入 Decoder ─────
+            # output_memory:   (N, sum_hw, 256)  经过 LN 的 memory
+            # output_proposals: (N, sum_hw, 4)   逆 sigmoid 的初始参考框 (cx,cy,w,h)
             output_memory, output_proposals = \
                 self.gen_encoder_output_proposals(
                     memory, memory_mask, spatial_shapes)
+            # 用最后一个预测层（层号=decoder.num_layers）对所有 memory 位置分类
             enc_outputs_class = self.bbox_head.cls_branches[
                 self.decoder.num_layers](
-                    output_memory)
+                    output_memory)    # (N, sum_hw, num_classes)
             enc_outputs_coord_unact = self.bbox_head.reg_branches[
                 self.decoder.num_layers](output_memory) + output_proposals
-            enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
+            enc_outputs_coord = enc_outputs_coord_unact.sigmoid()   # (N, sum_hw, 4)
             # We only use the first channel in enc_outputs_class as foreground,
             # the other (num_classes - 1) channels are actually not used.
             # Its targets are set to be 0s, which indicates the first
@@ -315,24 +371,29 @@ class DeformableDETR(DetectionTransformer):
             # num_classes (similar convention in RPN).
             # See https://github.com/open-mmlab/mmdetection/blob/master/mmdet/models/dense_heads/deformable_detr_head.py#L241 # noqa
             # This follows the official implementation of Deformable DETR.
+            # 选得分最高的 num_queries 个位置作为 decoder queries
             topk_proposals = torch.topk(
-                enc_outputs_class[..., 0], self.num_queries, dim=1)[1]
+                enc_outputs_class[..., 0], self.num_queries, dim=1)[1]  # (N, 300)
             topk_coords_unact = torch.gather(
                 enc_outputs_coord_unact, 1,
-                topk_proposals.unsqueeze(-1).repeat(1, 1, 4))
+                topk_proposals.unsqueeze(-1).repeat(1, 1, 4))  # (N, 300, 4)
             topk_coords_unact = topk_coords_unact.detach()
-            reference_points = topk_coords_unact.sigmoid()
+            reference_points = topk_coords_unact.sigmoid()   # (N, 300, 4) ∈[0,1]
             pos_trans_out = self.pos_trans_fc(
                 self.get_proposal_pos_embed(topk_coords_unact))
-            pos_trans_out = self.pos_trans_norm(pos_trans_out)
-            query_pos, query = torch.split(pos_trans_out, c, dim=2)
+            pos_trans_out = self.pos_trans_norm(pos_trans_out)  # (N, 300, 512)
+            query_pos, query = torch.split(pos_trans_out, c, dim=2)  # 各 (N, 300, 256)
         else:
+            # ── 单阶段模式：可学习的固定 query ─────────────────────────────
             enc_outputs_class, enc_outputs_coord = None, None
+            # query_embedding: (num_queries, embed_dims*2) = (300, 512)
+            # 前 256 维为 query_pos（位置信息），后 256 维为 query（内容信息）
             query_embed = self.query_embedding.weight
-            query_pos, query = torch.split(query_embed, c, dim=1)
-            query_pos = query_pos.unsqueeze(0).expand(batch_size, -1, -1)
-            query = query.unsqueeze(0).expand(batch_size, -1, -1)
-            reference_points = self.reference_points_fc(query_pos).sigmoid()
+            query_pos, query = torch.split(query_embed, c, dim=1)  # 各 (300, 256)
+            query_pos = query_pos.unsqueeze(0).expand(batch_size, -1, -1)  # (N, 300, 256)
+            query = query.unsqueeze(0).expand(batch_size, -1, -1)          # (N, 300, 256)
+            # 将 query_pos 线性变换后 sigmoid，初始化参考点为 2D (cx, cy) 坐标
+            reference_points = self.reference_points_fc(query_pos).sigmoid()  # (N, 300, 2)
 
         decoder_inputs_dict = dict(
             query=query,
@@ -383,6 +444,20 @@ class DeformableDETR(DetectionTransformer):
             `hidden_states` of the decoder output and `references` including
             the initial and intermediate reference_points.
         """
+        # Transformer Decoder 前向推理
+        # query:            (N, 300, 256)   可学习 object queries
+        # memory:           (N, sum_hw, 256) Encoder 输出（多尺度特征记忆）
+        # reference_points: (N, 300, 2) 或 (N, 300, 4)  各 query 的参考位置
+        #
+        # 每个 Decoder 层：
+        #   1. Self-Attention（query 间）：(N, 300, 256) × (N, 300, 256)
+        #   2. Cross-Attention（query 与 memory）：可变形注意力，每个 query 在
+        #      4 个 FPN 层共 4 个参考点附近采样，大幅减少计算量
+        #   3. FFN：(N, 300, 256) → (N, 300, 1024) → (N, 300, 256)
+        #
+        # with_box_refine=True 时：
+        #   每层用 reg_branches[l] 预测 bbox 修正量，更新 reference_points
+        #   实现 iterative refinement（级联回归，类似 Cascade RCNN）
         inter_states, inter_references = self.decoder(
             query=query,
             value=memory,
@@ -394,7 +469,9 @@ class DeformableDETR(DetectionTransformer):
             valid_ratios=valid_ratios,
             reg_branches=self.bbox_head.reg_branches
             if self.with_box_refine else None)
-        references = [reference_points, *inter_references]
+        # inter_states:     (num_decoder_layers, N, 300, 256)
+        # inter_references: (num_decoder_layers, N, 300, 2or4)
+        references = [reference_points, *inter_references]   # (num_layers+1, N, 300, *)
         decoder_outputs_dict = dict(
             hidden_states=inter_states, references=references)
         return decoder_outputs_dict

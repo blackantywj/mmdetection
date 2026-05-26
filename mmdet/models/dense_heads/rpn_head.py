@@ -1,4 +1,28 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+# ============================================================
+# 【RPNHead：区域建议网络】
+#
+# 功能：在 FPN 每个层级的特征图上密集预测候选框（region proposals）。
+#
+# 【Anchor 设置（Faster-RCNN 默认）】
+#   每个特征点放置 3 个不同宽高比的 anchor（ratio=[0.5, 1.0, 2.0]）
+#   每个 FPN 层级的基准大小：P2=32, P3=64, P4=128, P5=256, P6=512
+#   共 3 个比例，因此 num_base_priors = 3
+#
+# 【forward_single 输出 shape（以 P3 层 H_l=100, W_l=167 为例）】
+#   rpn_cls_score: (N, 3, 100, 167)  → 3 个 anchor 的前景概率（sigmoid）
+#   rpn_bbox_pred: (N, 12, 100, 167) → 3×4 个 anchor 的偏移量（delta xywh）
+#
+# 【训练时样本分配（MaxIoUAssigner）】
+#   IoU > 0.7 → 正样本（前景 anchor）
+#   IoU < 0.3 → 负样本（背景 anchor）
+#   每张图最多采样 256 个（正负比例 1:1）
+#
+# 【推理后处理】
+#   1. 取每层前 nms_pre=2000 个置信度最高的 anchor
+#   2. 解码 delta → 真实坐标框
+#   3. 跨层 NMS（IoU=0.7），最终每张图保留 max_per_img=1000 个 proposals
+# ============================================================
 import copy
 from typing import List, Optional, Tuple
 
@@ -78,17 +102,30 @@ class RPNHead(AnchorHead):
                                  self.num_base_priors * reg_dim, 1)
 
     def forward_single(self, x: Tensor) -> Tuple[Tensor, Tensor]:
-        """Forward feature of a single scale level.
+        """单层 FPN 特征的前向推理。
+
+        【shape 变化（以 P3 层，stride=8，输入图 800×1333 为例）】
+          x:             (N, 256, 100, 167)   ← FPN 输出特征
+            ↓ rpn_conv (3×3 conv + ReLU)
+          x:             (N, 256, 100, 167)   ← 共享特征
+            ├─ rpn_cls (1×1 conv)
+          rpn_cls_score: (N, 3, 100, 167)     ← 3 anchor × 1 类（前景概率）
+            └─ rpn_reg (1×1 conv)
+          rpn_bbox_pred: (N, 12, 100, 167)    ← 3 anchor × 4 个偏移量
+
+        bbox_pred 的 4 个值为 DeltaXYWH 编码：
+          tx = (x_gt - x_anchor) / w_anchor
+          ty = (y_gt - y_anchor) / h_anchor
+          tw = log(w_gt / w_anchor)
+          th = log(h_gt / h_anchor)
 
         Args:
             x (Tensor): Features of a single scale level.
 
         Returns:
             tuple:
-                cls_score (Tensor): Cls scores for a single scale level \
-                    the channels number is num_base_priors * num_classes.
-                bbox_pred (Tensor): Box energies / deltas for a single scale \
-                    level, the channels number is num_base_priors * 4.
+                cls_score (Tensor): (N, num_base_priors * num_classes, H, W)
+                bbox_pred (Tensor): (N, num_base_priors * 4, H, W)
         """
         x = self.rpn_conv(x)
         x = F.relu(x)

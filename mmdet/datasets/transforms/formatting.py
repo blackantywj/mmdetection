@@ -1,4 +1,25 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+# ============================================================
+# 【数据流最后一站：PackDetInputs —— 将 results dict 打包为模型输入格式】
+#
+# PackDetInputs 是检测 pipeline 的最后一个 transform，负责：
+#   1. 将 img (H, W, 3) np.ndarray BGR → Tensor (3, H, W) float32
+#      注意：此时是 uint8 or float32，归一化由 DetDataPreprocessor 完成
+#   2. 将 gt_bboxes / gt_bboxes_labels / gt_masks 封装到 DetDataSample.gt_instances
+#   3. 将 img_id / ori_shape / img_shape 等元信息写入 DetDataSample.metainfo
+#
+# 输出：
+#   results['inputs']:     Tensor (3, H, W)  图像数据
+#   results['data_sample']: DetDataSample
+#     .gt_instances.bboxes:  HorizontalBoxes (N, 4)
+#     .gt_instances.labels:  Tensor (N,)
+#     .metainfo['img_shape']: tuple (H_resized, W_resized)
+#     .metainfo['ori_shape']: tuple (H_ori, W_ori)
+#     .metainfo['scale_factor']: (w_scale, h_scale)
+#
+# DataLoader 的 collate_fn 会把多个 DetDataSample 收集成 list，
+# 再由 DetDataPreprocessor 做批归一化和 pad。
+# ============================================================
 from typing import Optional, Sequence
 
 import numpy as np

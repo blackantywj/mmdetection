@@ -1,4 +1,24 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+# ============================================================
+# 【StandardRoIHead：Faster-RCNN 第二阶段检测头】
+#
+# 职责：
+#   1. 训练时：给每个 proposal 分配 GT 标签（MaxIoUAssigner）
+#             采样正负样本（RandomSampler，512个，正负比例1:3）
+#             提取 RoI 特征（SingleRoIExtractor，ROI Align）
+#             通过 BBoxHead 预测 cls_score + bbox_pred
+#             计算分类损失（CrossEntropy）和回归损失（SmoothL1）
+#   2. 推理时：直接提取所有 proposal 的 RoI 特征
+#             BBoxHead 预测得分和回归偏移
+#             SoftMax 类别得分 + 解码 bbox → 类 NMS → 最终检测框
+#
+# 【关键 shape】
+#   x:           tuple of (N, 256, H_l, W_l)   FPN 多尺度特征
+#   rois:        (num_rois, 5)   [batch_id, x1, y1, x2, y2]
+#   bbox_feats:  (num_rois, 256, 7, 7)          ROI Align 输出
+#   cls_score:   (num_rois, num_classes+1)       分类得分（含背景类）
+#   bbox_pred:   (num_rois, 4×num_classes)       回归偏移（各类别独立）
+# ============================================================
 from typing import List, Optional, Tuple
 
 import torch
@@ -145,21 +165,27 @@ class StandardRoIHead(BaseRoIHead):
         return losses
 
     def _bbox_forward(self, x: Tuple[Tensor], rois: Tensor) -> dict:
-        """Box head forward function used in both training and testing.
+        """BBox Head 前向推理（训练和推理共用）。
+
+        【shape 变化】
+          x:          tuple of (N, 256, H_l, W_l)   FPN 特征（P2~P5 共 4 层）
+          rois:       (num_rois, 5)   [batch_id, x1, y1, x2, y2]
+            ↓ bbox_roi_extractor（ROI Align，输出 7×7）
+          bbox_feats: (num_rois, 256, 7, 7)
+            ↓ bbox_head（Shared2FCBBoxHead）
+          cls_score:  (num_rois, num_classes + 1)   含背景类（+1）
+          bbox_pred:  (num_rois, 4 × num_classes)   每类独立的回归偏移
+                      如 COCO 80 类时 bbox_pred shape = (num_rois, 320)
 
         Args:
-            x (tuple[Tensor]): List of multi-level img features.
-            rois (Tensor): RoIs with the shape (n, 5) where the first
-                column indicates batch id of each RoI.
+            x (tuple[Tensor]): Multi-level img features.
+            rois (Tensor): (n, 5)  第一列为 batch_id
 
         Returns:
-             dict[str, Tensor]: Usually returns a dictionary with keys:
-
-                - `cls_score` (Tensor): Classification scores.
-                - `bbox_pred` (Tensor): Box energies / deltas.
-                - `bbox_feats` (Tensor): Extract bbox RoI features.
+             dict containing cls_score, bbox_pred, bbox_feats.
         """
         # TODO: a more flexible way to decide which feature maps to use
+        # 只使用前 num_inputs 个 FPN 层（通常 P2~P5，共 4 层）
         bbox_feats = self.bbox_roi_extractor(
             x[:self.bbox_roi_extractor.num_inputs], rois)
         if self.with_shared_head:
